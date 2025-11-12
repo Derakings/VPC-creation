@@ -44,6 +44,9 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# Load required kernel modules
+modprobe br_netfilter 2>/dev/null || true
+
 # ==========================================
 # Helper Functions
 # ==========================================
