@@ -1,11 +1,30 @@
 {
-  "subnet": "10.0.1.0/24",
-  "ingress": [
-    {"port": 80, "protocol": "tcp", "action": "allow"},
-    {"port": 443, "protocol": "tcp", "action": "allow"},
-    {"port": 22, "protocol": "tcp", "action": "deny"}
-  ],
-  "egress": [
-    {"port": 0, "protocol": "all", "action": "allow"}
+  "policies": [
+    {
+      "name": "web-server",
+      "subnet": "10.0.1.0/24",
+      "ingress": [
+        {"port": 80, "protocol": "tcp", "action": "allow", "description": "HTTP"},
+        {"port": 443, "protocol": "tcp", "action": "allow", "description": "HTTPS"},
+        {"port": 22, "protocol": "tcp", "action": "deny", "description": "SSH blocked"},
+        {"port": 8080, "protocol": "tcp", "action": "allow", "description": "Alt HTTP"}
+      ],
+      "egress": [
+        {"port": 0, "protocol": "all", "action": "allow", "description": "Allow all outbound"}
+      ]
+    },
+    {
+      "name": "database-server",
+      "subnet": "10.0.2.0/24",
+      "ingress": [
+        {"port": 3306, "protocol": "tcp", "action": "allow", "description": "MySQL"},
+        {"port": 5432, "protocol": "tcp", "action": "allow", "description": "PostgreSQL"},
+        {"port": 22, "protocol": "tcp", "action": "allow", "description": "SSH admin"}
+      ],
+      "egress": [
+        {"port": 443, "protocol": "tcp", "action": "allow", "description": "HTTPS only"},
+        {"port": 80, "protocol": "tcp", "action": "deny", "description": "Block HTTP"}
+      ]
+    }
   ]
 }
