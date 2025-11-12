@@ -1,0 +1,187 @@
+#!/bin/bash
+# VPC Controller - Simple Bash Version
+
+# Colors
+log_info() { echo -e "\033[0;34m[INFO]\033[0m $1"; }
+log_success() { echo -e "\033[0;32m✅\033[0m $1"; }
+log_error() { echo -e "\033[0;31m❌\033[0m $1"; }
+
+# Check root
+if [ "$EUID" -ne 0 ]; then
+    log_error "Please run with sudo"
+    exit 1
+fi
+
+# COMMAND: create-vpc
+if [ "$1" = "create-vpc" ]; then
+    VPC_NAME=$2
+    CIDR=$3
+    BRIDGE="vpc-${VPC_NAME}-br"
+    
+    log_info "Creating VPC: $VPC_NAME ($CIDR)"
+    
+    # Create bridge
+    ip link add name "$BRIDGE" type bridge
+    ip link set "$BRIDGE" up
+    
+    # Assign IP to bridge
+    BRIDGE_IP="${CIDR%.*}.1/${CIDR##*/}"
+    ip addr add "$BRIDGE_IP" dev "$BRIDGE"
+    
+    log_success "VPC '$VPC_NAME' created!"
+    log_info "Bridge: $BRIDGE"
+    log_info "Gateway: $BRIDGE_IP"
+
+# COMMAND: add-subnet
+elif [ "$1" = "add-subnet" ]; then
+    VPC_NAME=$2
+    SUBNET_NAME=$3
+    SUBNET_CIDR=$4
+    
+    BRIDGE="vpc-${VPC_NAME}-br"
+    NAMESPACE="vpc-${VPC_NAME}-${SUBNET_NAME}"
+    VETH_HOST="veth-${SUBNET_NAME}-h"
+    VETH_NS="veth-${SUBNET_NAME}-n"
+    
+    log_info "Adding subnet: $SUBNET_NAME to VPC $VPC_NAME"
+    
+    # Create namespace
+    ip netns add "$NAMESPACE" 2>/dev/null || true
+    
+    # Delete old veth if exists
+    ip link del "$VETH_HOST" 2>/dev/null || true
+
+    # Create veth pair
+    ip link add "$VETH_HOST" type veth peer name "$VETH_NS"
+    
+    # Move one end to namespace
+    ip link set "$VETH_NS" netns "$NAMESPACE"
+    
+    # Connect to bridge
+    ip link set "$VETH_HOST" master "$BRIDGE"
+    ip link set "$VETH_HOST" up
+    
+    # Configure namespace
+    ip netns exec "$NAMESPACE" ip link set lo up
+    ip netns exec "$NAMESPACE" ip link set "$VETH_NS" up
+    
+    # Assign IP
+    NS_IP="${SUBNET_CIDR%.*}.2/${SUBNET_CIDR##*/}"
+    ip netns exec "$NAMESPACE" ip addr add "$NS_IP" dev "$VETH_NS" 2>/dev/null || true
+    
+    # Add default route
+    GATEWAY="${SUBNET_CIDR%.*}.1"
+
+    # Add gateway IP to bridge if not exists
+    ip addr add "${GATEWAY}/${SUBNET_CIDR##*/}" dev "$BRIDGE" 2>/dev/null || true
+    
+    ip netns exec "$NAMESPACE" ip route add default via "$GATEWAY"  # Add gateway IP to bridge    
+    log_success "Subnet '$SUBNET_NAME' created!"
+    log_info "Namespace: $NAMESPACE"
+    log_info "IP: $NS_IP"
+
+# COMMAND: enable-nat
+elif [ "$1" = "enable-nat" ]; then
+    VPC_NAME=$2
+    SUBNET_CIDR=$3
+    EXT_IF=${4:-eth0}
+    
+    log_info "Enabling NAT for $SUBNET_CIDR"
+    
+    # Enable forwarding
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    
+    # Add NAT rules
+    iptables -t nat -A POSTROUTING -s "$SUBNET_CIDR" -o "$EXT_IF" -j MASQUERADE
+    iptables -A FORWARD -s "$SUBNET_CIDR" -j ACCEPT
+    iptables -A FORWARD -d "$SUBNET_CIDR" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    
+    log_success "NAT enabled!"
+
+# COMMAND: start-server
+elif [ "$1" = "start-server" ]; then
+    NAMESPACE=$2
+    PORT=${3:-8080}
+    
+    log_info "Starting web server in $NAMESPACE on port $PORT"
+    
+    # Create web directory
+    mkdir -p /tmp/vpc-web-$NAMESPACE
+    echo "<h1>Hello from $NAMESPACE</h1><p>Server is running!</p>" > /tmp/vpc-web-$NAMESPACE/index.html
+    
+    # Start server
+    ip netns exec "$NAMESPACE" bash -c "cd /tmp/vpc-web-$NAMESPACE && nohup python3 -m http.server $PORT &>/dev/null &"
+    
+    sleep 1
+    log_success "Web server started on port $PORT"
+
+# COMMAND: stop-server
+elif [ "$1" = "stop-server" ]; then
+    NAMESPACE=$2
+    
+    log_info "Stopping web server in $NAMESPACE"
+    
+    ip netns exec "$NAMESPACE" pkill -f "http.server" 2>/dev/null || true
+    rm -rf /tmp/vpc-web-$NAMESPACE
+    
+    log_success "Web server stopped"
+
+# COMMAND: delete-vpc
+elif [ "$1" = "delete-vpc" ]; then
+    VPC_NAME=$2
+    BRIDGE="vpc-${VPC_NAME}-br"
+    
+    log_info "Deleting VPC: $VPC_NAME"
+    
+    # Delete all namespaces for this VPC
+    for ns in $(ip netns list | grep "vpc-${VPC_NAME}-" | awk '{print $1}'); do
+        log_info "Deleting namespace: $ns"
+        ip netns del "$ns" 2>/dev/null
+    done
+    
+    # Delete bridge
+    if ip link show "$BRIDGE" &>/dev/null; then
+        ip link set "$BRIDGE" down 2>/dev/null
+        ip link delete "$BRIDGE" 2>/dev/null
+        log_info "Bridge deleted: $BRIDGE"
+    fi
+    
+    log_success "VPC '$VPC_NAME' deleted!"
+
+# COMMAND: list
+elif [ "$1" = "list" ]; then
+    echo "VPC Namespaces:"
+    ip netns list | grep "^vpc-" || echo "  (none)"
+    echo ""
+    echo "VPC Bridges:"
+    ip link show type bridge | grep "vpc-" | awk '{print "  " $2}' | tr -d ':' || echo "  (none)"
+
+# COMMAND: help or no command
+else
+    cat << 'HELP'
+vpcctl - VPC Controller
+
+Usage:
+  sudo ./vpcctl create-vpc <name> <cidr>
+      Example: sudo ./vpcctl create-vpc myvpc 10.0.0.0/16
+
+  sudo ./vpcctl add-subnet <vpc-name> <subnet-name> <cidr>
+      Example: sudo ./vpcctl add-subnet myvpc public 10.0.1.0/24
+
+  sudo ./vpcctl enable-nat <vpc-name> <subnet-cidr> [interface]
+      Example: sudo ./vpcctl enable-nat myvpc 10.0.1.0/24
+
+  sudo ./vpcctl start-server <namespace> [port]
+      Example: sudo ./vpcctl start-server vpc-myvpc-public 8080
+
+  sudo ./vpcctl stop-server <namespace>
+      Example: sudo ./vpcctl stop-server vpc-myvpc-public
+
+  sudo ./vpcctl delete-vpc <name>
+      Example: sudo ./vpcctl delete-vpc myvpc
+
+  sudo ./vpcctl list
+      List all VPCs and namespaces
+
+HELP
+fi
