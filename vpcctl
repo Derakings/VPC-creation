@@ -44,6 +44,9 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# Load required kernel modules
+modprobe br_netfilter 2>/dev/null || true
+
 # ==========================================
 # Helper Functions
 # ==========================================
@@ -99,6 +102,10 @@ if [ "$1" = "create-vpc" ]; then
     
     log_info "Creating VPC: $VPC_NAME ($CIDR)"
     
+    # Enable bridge forwarding
+    echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || true
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    
     # Create bridge
     if ! ip link add name "$BRIDGE" type bridge 2>/dev/null; then
         log_error "Failed to create bridge $BRIDGE"
@@ -151,6 +158,10 @@ elif [ "$1" = "add-subnet" ]; then
     
     log_info "Adding subnet: $SUBNET_NAME to VPC $VPC_NAME"
     
+    # Enable bridge forwarding
+    echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || true
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    
     # Create namespace
     ip netns add "$NAMESPACE"
     
@@ -191,11 +202,17 @@ elif [ "$1" = "add-subnet" ]; then
 elif [ "$1" = "enable-nat" ]; then
     VPC_NAME=$2
     SUBNET_CIDR=$3
-    EXT_IF=${4:-eth0}
+    EXT_IF=$4
     
     if [ -z "$VPC_NAME" ] || [ -z "$SUBNET_CIDR" ]; then
         log_error "Usage: vpcctl enable-nat <vpc-name> <subnet-cidr> [interface]"
         exit 1
+    fi
+    
+    # Auto-detect default interface if not specified
+    if [ -z "$EXT_IF" ]; then
+        EXT_IF=$(ip route | grep default | awk '{print $5}' | head -n1)
+        log_info "Auto-detected external interface: $EXT_IF"
     fi
     
     log_info "Enabling NAT for $SUBNET_CIDR via $EXT_IF"
@@ -245,20 +262,42 @@ elif [ "$1" = "apply-security-group" ]; then
     
     log_info "Applying security group rules to $NAMESPACE"
     
-    # Parse JSON and apply iptables rules
-    while IFS= read -r line; do
-        port=$(echo "$line" | jq -r '.port')
-        protocol=$(echo "$line" | jq -r '.protocol')
-        action=$(echo "$line" | jq -r '.action')
-        
-        if [ "$action" = "allow" ]; then
-            ip netns exec "$NAMESPACE" iptables -A INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null || true
-            log_info "ALLOW: $protocol port $port"
-        elif [ "$action" = "deny" ]; then
-            ip netns exec "$NAMESPACE" iptables -A INPUT -p "$protocol" --dport "$port" -j DROP 2>/dev/null || true
-            log_info "DENY: $protocol port $port"
-        fi
-    done < <(jq -c '.ingress[]' "$POLICY_FILE" 2>/dev/null)
+    # Set default policy to ACCEPT first
+    ip netns exec "$NAMESPACE" iptables -P INPUT ACCEPT 2>/dev/null || true
+    
+    # Parse and apply each rule
+    # Check if file has policies array or direct ingress array
+    if jq -e '.policies' "$POLICY_FILE" >/dev/null 2>&1; then
+        # File has policies array, use first policy's ingress rules
+        jq -c '.policies[0].ingress[]' "$POLICY_FILE" 2>/dev/null | while IFS= read -r line; do
+            port=$(echo "$line" | jq -r '.port')
+            protocol=$(echo "$line" | jq -r '.protocol')
+            action=$(echo "$line" | jq -r '.action')
+            
+            if [ "$action" = "deny" ]; then
+                ip netns exec "$NAMESPACE" iptables -A INPUT -p "$protocol" --dport "$port" -j DROP
+                log_info "DENY: $protocol port $port"
+            elif [ "$action" = "allow" ]; then
+                ip netns exec "$NAMESPACE" iptables -A INPUT -p "$protocol" --dport "$port" -j ACCEPT
+                log_info "ALLOW: $protocol port $port"
+            fi
+        done
+    else
+        # File has direct ingress array
+        jq -c '.ingress[]' "$POLICY_FILE" 2>/dev/null | while IFS= read -r line; do
+            port=$(echo "$line" | jq -r '.port')
+            protocol=$(echo "$line" | jq -r '.protocol')
+            action=$(echo "$line" | jq -r '.action')
+            
+            if [ "$action" = "deny" ]; then
+                ip netns exec "$NAMESPACE" iptables -A INPUT -p "$protocol" --dport "$port" -j DROP
+                log_info "DENY: $protocol port $port"
+            elif [ "$action" = "allow" ]; then
+                ip netns exec "$NAMESPACE" iptables -A INPUT -p "$protocol" --dport "$port" -j ACCEPT
+                log_info "ALLOW: $protocol port $port"
+            fi
+        done
+    fi
     
     log_success "Security group applied to $NAMESPACE"
 
@@ -307,6 +346,19 @@ elif [ "$1" = "create-peering" ]; then
     # Bring up interfaces
     ip link set "$VETH1" up
     ip link set "$VETH2" up
+    
+    # Get CIDRs from state files
+    VPC1_CIDR=$(grep "CIDR=" "$STATE_DIR/${VPC1}.state" | cut -d= -f2)
+    VPC2_CIDR=$(grep "CIDR=" "$STATE_DIR/${VPC2}.state" | cut -d= -f2)
+    
+    # Add routes to all namespaces in each VPC
+    for ns in $(ip netns list | grep "vpc-${VPC1}-" | awk '{print $1}'); do
+        ip netns exec "$ns" ip route add "$VPC2_CIDR" via "${VPC1_CIDR%.*}.1" 2>/dev/null || true
+    done
+    
+    for ns in $(ip netns list | grep "vpc-${VPC2}-" | awk '{print $1}'); do
+        ip netns exec "$ns" ip route add "$VPC1_CIDR" via "${VPC2_CIDR%.*}.1" 2>/dev/null || true
+    done
     
     # Save peering state
     echo "${VPC1}<->${VPC2}|${VETH1}|${VETH2}" >> "$PEERING_FILE"
@@ -474,10 +526,10 @@ elif [ "$1" = "delete-vpc" ]; then
         sed -i "/${VPC_NAME}/d" "$PEERING_FILE"
     fi
     
-    # Delete all namespaces for this VPC
-    for ns in $(ip netns list | grep "vpc-${VPC_NAME}-" | awk '{print $1}'); do
+    # Delete all namespaces more robustly
+    ip netns list 2>/dev/null | awk '{print $1}' | grep "^vpc-${VPC_NAME}-" | while read -r ns; do
         log_info "Deleting namespace: $ns"
-        ip netns del "$ns" 2>/dev/null
+        ip netns del "$ns" 2>/dev/null || true
     done
     
     # Delete bridge
