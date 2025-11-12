@@ -263,19 +263,38 @@ elif [ "$1" = "apply-security-group" ]; then
     ip netns exec "$NAMESPACE" iptables -P INPUT ACCEPT 2>/dev/null || true
     
     # Parse and apply each rule
-    jq -c '.ingress[]' "$POLICY_FILE" 2>/dev/null | while IFS= read -r line; do
-        port=$(echo "$line" | jq -r '.port')
-        protocol=$(echo "$line" | jq -r '.protocol')
-        action=$(echo "$line" | jq -r '.action')
-        
-        if [ "$action" = "deny" ]; then
-            ip netns exec "$NAMESPACE" iptables -A INPUT -p "$protocol" --dport "$port" -j DROP
-            log_info "DENY: $protocol port $port"
-        elif [ "$action" = "allow" ]; then
-            ip netns exec "$NAMESPACE" iptables -A INPUT -p "$protocol" --dport "$port" -j ACCEPT
-            log_info "ALLOW: $protocol port $port"
-        fi
-    done
+    # Check if file has policies array or direct ingress array
+    if jq -e '.policies' "$POLICY_FILE" >/dev/null 2>&1; then
+        # File has policies array, use first policy's ingress rules
+        jq -c '.policies[0].ingress[]' "$POLICY_FILE" 2>/dev/null | while IFS= read -r line; do
+            port=$(echo "$line" | jq -r '.port')
+            protocol=$(echo "$line" | jq -r '.protocol')
+            action=$(echo "$line" | jq -r '.action')
+            
+            if [ "$action" = "deny" ]; then
+                ip netns exec "$NAMESPACE" iptables -A INPUT -p "$protocol" --dport "$port" -j DROP
+                log_info "DENY: $protocol port $port"
+            elif [ "$action" = "allow" ]; then
+                ip netns exec "$NAMESPACE" iptables -A INPUT -p "$protocol" --dport "$port" -j ACCEPT
+                log_info "ALLOW: $protocol port $port"
+            fi
+        done
+    else
+        # File has direct ingress array
+        jq -c '.ingress[]' "$POLICY_FILE" 2>/dev/null | while IFS= read -r line; do
+            port=$(echo "$line" | jq -r '.port')
+            protocol=$(echo "$line" | jq -r '.protocol')
+            action=$(echo "$line" | jq -r '.action')
+            
+            if [ "$action" = "deny" ]; then
+                ip netns exec "$NAMESPACE" iptables -A INPUT -p "$protocol" --dport "$port" -j DROP
+                log_info "DENY: $protocol port $port"
+            elif [ "$action" = "allow" ]; then
+                ip netns exec "$NAMESPACE" iptables -A INPUT -p "$protocol" --dport "$port" -j ACCEPT
+                log_info "ALLOW: $protocol port $port"
+            fi
+        done
+    fi
     
     log_success "Security group applied to $NAMESPACE"
 
